@@ -1,0 +1,23 @@
+{
+  "python.defaultInterpreterPath": "python",
+  "python.analysis.autoImportCompletions": true,
+  "editor.formatOnSave": true,
+  "sqltools.connections": [
+    {
+      "pgOptions": {
+        "ssl": {
+          "rejectUnauthorized": true
+        }
+      },
+      "ssh": "Disabled",
+      "previewLimit": 50,
+      "name": "Polymarket Neon",
+      "driver": "PostgreSQL",
+      "database": "neondb",
+      "username": "USER",
+      "password": "PASSWORD",
+      "ssl": true,
+      "connectString": "postgresql://neondb_owner:npg_LElmfo60qjJV@ep-restless-mountain-ajqxwoiz-pooler.c-3.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+    }
+  ]
+}

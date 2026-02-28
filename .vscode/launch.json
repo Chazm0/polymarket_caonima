@@ -1,0 +1,49 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Ingest Markets",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pm.cli",
+            "args": [
+                "ingest-markets"
+            ],
+            "envFile": "${workspaceFolder}/.env",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Collect Orderbooks",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pm.cli",
+            "args": [
+                "collect-orderbooks"
+            ],
+            "envFile": "${workspaceFolder}/.env",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Features",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pm.cli",
+            "args": [
+                "build-features"
+            ],
+            "envFile": "${workspaceFolder}/.env",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Export Dataset",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pm.cli",
+            "args": [
+                "export"
+            ],
+            "envFile": "${workspaceFolder}/.env",
+            "console": "integratedTerminal"
+        }
+    ]
+}

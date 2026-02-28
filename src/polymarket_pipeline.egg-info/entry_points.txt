@@ -1,0 +1,2 @@
+[console_scripts]
+pm = pm.cli:main
