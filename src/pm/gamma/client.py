@@ -36,11 +36,15 @@ class GammaClient:
     def event_by_slug(self, slug: str) -> Dict[str, Any]:
         return self._get(f"/events/slug/{slug}")
 
-    def list_markets(self, *, event_id: Optional[int] = None, limit: int = 1000, offset: int = 0) -> Any:
+    def list_markets(self, *, event_id=None, limit=1000, offset=0, active_only=True) -> Any:
         params = {"limit": limit, "offset": offset}
+        if active_only:
+            params["active"] = "true"
+            params["closed"] = "false"
         if event_id is not None:
             params["event_id"] = event_id
         return self._get("/markets", params=params)
+
 
     def market_by_id(self, market_id: int) -> Dict[str, Any]:
         return self._get(f"/markets/{market_id}")

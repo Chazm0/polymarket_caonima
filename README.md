@@ -1,319 +1,353 @@
-Polymarket Postgres Pipeline
+# Polymarket Pipeline
 
-A Postgres-first microstructure data pipeline for:
+A Postgres-first pipeline for ingesting Polymarket market metadata and live orderbook snapshots, computing microstructure features, and exporting clean datasets.
 
-Ingesting markets from Gamma
+---
 
-Selecting markets via manual tracking or Auto-Tracker
+## Architecture
 
-Collecting CLOB orderbooks
+```
+Gamma API ──► ingest-markets ──► markets (Postgres)
+                                        │
+                               auto-track / track-markets
+                                        │
+                               tracked_markets (Postgres)
+                                        │
+CLOB API ──► collect-orderbooks ──► orderbook_snapshots
+                                        │
+                               features_orderbook
+                                        │
+                               export ──► clean_orderbook_dataset.csv
+```
 
-Computing advanced orderbook features
+---
 
-Exporting modeling-ready datasets
+## Prerequisites
 
-Architecture Overview
-Gamma API  →  markets
-                 ↓
-           tracked_markets  ← (manual + auto-tracker)
-                 ↓
-          orderbook_snapshots  ← CLOB /book endpoint
-                 ↓
-           features_orderbook
-                 ↓
-               export
-Tables
-Table	Purpose
-markets	Canonical Gamma market metadata
-tracked_markets	Controls which markets are collected
-orderbook_snapshots	Raw time-series orderbook data
-features_orderbook	Derived microstructure features
-schema_migrations	Migration tracking
-Feature Engineering (NEW)
+- Python 3.10+
+- A running Postgres database (local or [Neon](https://neon.tech))
 
-Each snapshot now computes:
+---
 
-Level 1
+## Installation
 
-spread
-
-mid = (best_bid + best_ask)/2
-
-microprice = (ask * bid_size + bid * ask_size) / (bid_size + ask_size)
-
-imbalance_l1
-
-Top-N (default N=30)
-
-bid_depth_top_n
-
-ask_depth_top_n
-
-Top-5 Depth Metrics (NEW)
-
-depth_bid_top5
-
-depth_ask_top5
-
-imbalance_top5 = (depth_bid_top5 - depth_ask_top5) / (depth_bid_top5 + depth_ask_top5)
-
-1️⃣ Requirements
-
-Python 3.11+
-
-Postgres (Neon recommended)
-
-Internet access to:
-
-https://gamma-api.polymarket.com
-
-https://clob.polymarket.com
-
-2️⃣ Setup
-
-From repo root:
-
+```bash
+# 1. Create and activate a virtual environment
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
-python -m pip install -e .
+source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 
-Verify CLI:
+# On Windows PowerShell — if activation is blocked:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
+# 2. Install the package in editable mode
+pip install -e .
+
+# 3. Confirm CLI is available
 pm --help
-3️⃣ Configure .env
+```
 
-Example (Neon):
+---
 
-DATABASE_DSN_PG=postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require
+## Configuration
+
+Create a `.env` file in the project root:
+
+```env
+# Required
+DATABASE_DSN_PG=postgresql://user:password@host:5432/dbname?sslmode=require
+
+# Optional — defaults shown
 GAMMA_BASE=https://gamma-api.polymarket.com
 CLOB_BASE=https://clob.polymarket.com
-USER_AGENT=pm-pipeline/0.1
-STATEMENT_TIMEOUT_MS=60000
-DEFAULT_BATCH_SIZE=20
-DEFAULT_TOP_N=30
+DEFAULT_BATCH_SIZE=50
+DEFAULT_TOP_N=10
 DEFAULT_LOOP_SECONDS=2.0
+DEFAULT_STATEMENT_TIMEOUT_MS=60000
+PM_USER_AGENT=polymarket-pipeline/0.1.0
+```
 
-⚠️ If you see:
+`DATABASE_DSN_PG` is the only required variable.
 
-getaddrinfo ENOTFOUND HOST
+---
 
-You left HOST as a placeholder. Replace with your actual Neon hostname.
+## Step-by-step
 
-4️⃣ Apply Migrations
+### 1. Apply migrations
+
+Run once (idempotent — safe to re-run):
+
+```bash
 pm migrate
-5️⃣ Reset Database (if needed)
-TRUNCATE TABLE
-  features_orderbook,
-  orderbook_snapshots,
-  tracked_markets,
-  markets
-CASCADE;
+```
 
-Why CASCADE?
-Postgres blocks truncating referenced tables otherwise.
+Creates these tables:
 
-6️⃣ Ingest Markets
+| Table | Purpose |
+|---|---|
+| `markets` | Market metadata from Gamma API |
+| `tracked_markets` | Markets selected for orderbook collection |
+| `orderbook_snapshots` | Raw L2 book snapshots per token, time-series |
+| `features_orderbook` | Derived microstructure features per snapshot |
+| `schema_migrations` | Migration tracking (internal) |
+
+---
+
+### 2. Ingest markets
+
+Pull active market metadata from the Gamma API into `markets`:
+
+```bash
 pm ingest-markets --pages 5 --limit 1000
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--pages` | `1` | Number of pages to fetch |
+| `--limit` | `1000` | Markets per page |
+| `--event-id` | none | Restrict to a specific event ID |
+
+Markets are upserted — re-running is safe. The ingester only stores active markets (skips closed, resolved, and markets ended >30 days ago).
 
 Verify:
 
+```sql
 SELECT COUNT(*) AS n, MAX(end_time) FROM markets;
-7️⃣ Track Markets
-Manual
-pm track-markets --session manual --market-ids 123,456
-Auto-Tracker
+```
 
-Track high liquidity:
+---
 
-pm auto-track --session hot --top 200 --min-liquidity 5000
+### 3. Select markets to track
 
-Track markets ending soon:
+#### Option A — Auto-track (recommended)
 
-pm auto-track --session ending_24h --top 200 --ends-within-hours 24
+Selects the top N markets from `markets` ranked by liquidity → volume → recency and inserts them into `tracked_markets`.
 
-Dry run:
+```bash
+pm auto-track --session my_session --top 200
+```
 
-pm auto-track --session hot --top 50 --dry-run
-8️⃣ Refresh Expired Markets
-pm refresh-ended
-9️⃣ Collect Orderbooks
+Common examples:
 
-Now uses:
+```bash
+# Only markets with at least $5k liquidity
+pm auto-track --session liq5k --top 100 --min-liquidity 5000
 
-GET /book?token_id=...
+# Only markets ending within the next 24 hours
+pm auto-track --session ending_soon --top 50 --ends-within-hours 24
 
-Example:
+# Filter by category
+pm auto-track --session politics --top 100 --category Politics
 
-pm collect-orderbooks --iterations 3
+# Dry run — prints what would be tracked, no writes
+pm auto-track --session test --top 50 --dry-run
+```
 
-Continuous mode:
+| Flag | Default | Description |
+|---|---|---|
+| `--session` | **required** | Label stored in `tracked_markets.sessions[]` |
+| `--top` | `200` | Max markets to select |
+| `--min-liquidity` | none | Minimum `liquidity_num` |
+| `--min-volume` | none | Minimum `volume_num` |
+| `--ends-within-hours` | none | Only markets ending within N hours |
+| `--category` | none | Filter by category string |
+| `--include-closed` | false | Also include closed/resolved markets |
+| `--include-already-tracked` | false | Re-add markets already in `tracked_markets` |
+| `--allow-missing-token-keys` | false | Include markets without `clobTokenIds` in raw JSON |
+| `--dry-run` | false | Print selection without writing |
 
+#### Option B — Manual track
+
+Track specific market IDs directly:
+
+```bash
+pm track-markets --session my_session --market-ids 123456,789012
+```
+
+---
+
+### 4. Collect orderbooks
+
+Polls the CLOB API for every token in non-ended tracked markets, stores raw snapshots, and computes features inline. Runs indefinitely by default.
+
+```bash
 pm collect-orderbooks
+```
 
-Custom:
+Common usage:
 
-pm collect-orderbooks --batch 10 --top-n 30 --loop-seconds 2
+```bash
+# Fixed number of iterations then exit
+pm collect-orderbooks --iterations 100
 
-If you see:
+# One-shot pass (no loop)
+pm collect-orderbooks --iterations 1 --loop-seconds 0
 
-[collect] no tracked tokens found
+# Custom tuning
+pm collect-orderbooks --batch 25 --top-n 5 --loop-seconds 5.0
+```
 
-Check:
+| Flag | Default (from .env) | Description |
+|---|---|---|
+| `--batch` | `DEFAULT_BATCH_SIZE` (50) | Tokens per request batch |
+| `--top-n` | `DEFAULT_TOP_N` (10) | Top N bid/ask levels to store |
+| `--loop-seconds` | `DEFAULT_LOOP_SECONDS` (2.0) | Sleep between full sweeps |
+| `--per-batch-sleep` | `0.1` | Sleep between batches within a sweep |
+| `--iterations` | `0` (forever) | Stop after N iterations |
 
-SELECT COUNT(*) FROM tracked_markets WHERE ended=false;
-🔟 Export Dataset
-pm export --market-id 123 --expected-seconds 2
+Each iteration logs:
 
-With time window:
+```
+[collect] iter=1 ts=2026-03-10T12:00:00+00:00 inserted=42/50 fetched=50
+```
 
-pm export --market-id 123 --start 2026-02-28T00:00:00Z --end 2026-02-28T06:00:00Z
+If you see `[collect] no tracked tokens found`, check:
 
-Outputs:
+```sql
+SELECT COUNT(*) FROM tracked_markets WHERE ended = false;
+```
 
-clean_orderbook_dataset.csv
+---
 
-flagged_corrupted_rows.csv
+### 5. Refresh ended flags (optional, run periodically)
 
-11️⃣ VS Code Setup (IMPORTANT)
-Required Extensions
+Marks `tracked_markets.ended = TRUE` for any market that is now closed, resolved, or past its `end_time`. This stops `collect-orderbooks` from polling expired markets.
 
-Install these from VS Code Extensions panel:
+```bash
+pm refresh-ended
+```
 
-1️⃣ SQLTools
+---
 
-Publisher: mtxr
+### 6. Export dataset
 
-2️⃣ SQLTools PostgreSQL Driver
+Exports orderbook feature rows to CSV, with optional corruption flagging.
 
-Publisher: mtxr
+```bash
+pm export
+```
 
-How to Install
+With filters:
 
-Open VS Code
+```bash
+# Specific market
+pm export --market-id 123456
 
-Press Ctrl + Shift + X
+# Specific token
+pm export --token-id 0xabc...
 
-Search:
+# Time window
+pm export --start 2026-03-01T00:00:00Z --end 2026-03-10T00:00:00Z
 
-SQLTools
+# Custom output files
+pm export --out-clean my_data.csv --out-corrupted bad_rows.csv
 
-Install
+# Flag rows where snapshot interval deviates from expected cadence
+pm export --expected-seconds 2.0 --tolerance-seconds 0.5
+```
 
-Search:
+| Flag | Default | Description |
+|---|---|---|
+| `--market-id` | none | Filter to one market |
+| `--token-id` | none | Filter to one token |
+| `--start` | none | ISO8601 start timestamp |
+| `--end` | none | ISO8601 end timestamp |
+| `--top-n-flatten` | `10` | Bid/ask levels to flatten into columns |
+| `--expected-seconds` | none | Expected interval between snapshots |
+| `--tolerance-seconds` | `0.5` | Allowed deviation from expected interval |
+| `--out-clean` | `clean_orderbook_dataset.csv` | Output for clean rows |
+| `--out-corrupted` | `flagged_corrupted_rows.csv` | Output for flagged rows |
 
-SQLTools PostgreSQL
+Prints: `[export] clean_rows=18432 corrupted_rows=12`
 
-Install
+---
 
-Restart VS Code after installing.
+## Typical full run
 
-Create Neon Connection
+```bash
+# 1. Apply schema (once)
+pm migrate
 
-Open Command Palette (Ctrl + Shift + P)
+# 2. Pull ~5000 active markets
+pm ingest-markets --pages 5 --limit 1000
 
-Run:
+# 3. Auto-select top 100 liquid markets
+pm auto-track --session run1 --top 100 --min-liquidity 5000
 
-SQLTools: Add New Connection
+# 4. Collect continuously (run in a terminal/screen/tmux session)
+pm collect-orderbooks --loop-seconds 2.0
 
-Select:
+# 5. Periodically expire ended markets
+pm refresh-ended
 
-PostgreSQL
+# 6. Export
+pm export --out-clean dataset.csv
+```
 
-Fill:
+---
 
-Host → your Neon host
+## Useful diagnostic queries
 
-Port → 5432
-
-Database → your DB name
-
-Username → your Neon user
-
-Password → your Neon password
-
-SSL → Enabled
-
-Save.
-
-Common SQLTools Errors
-❌ Cannot read properties of null (reading 'driver')
-
-Fix:
-
-Delete broken connection from settings.json
-
-Recreate connection
-
-Ensure driver = "PostgreSQL"
-
-❌ getaddrinfo ENOTFOUND HOST
-
-You left HOST as literal text. Replace with real hostname.
-
-12️⃣ Useful SQL Diagnostics
-
-Active markets:
-
+```sql
+-- Active markets available
 SELECT COUNT(*)
 FROM markets
-WHERE COALESCE(is_closed,false)=false
-  AND COALESCE(is_resolved,false)=false
+WHERE COALESCE(is_closed, false) = false
+  AND COALESCE(is_resolved, false) = false
   AND (end_time IS NULL OR end_time > NOW());
 
-Tracked active:
+-- Tracked markets still active
+SELECT COUNT(*) FROM tracked_markets WHERE ended = false;
 
-SELECT COUNT(*) FROM tracked_markets WHERE ended=false;
-
-Latest snapshot per token:
-
+-- Latest snapshot per token
 SELECT DISTINCT ON (token_id)
   token_id, ts_utc, best_bid_price, best_ask_price
 FROM orderbook_snapshots
 ORDER BY token_id, ts_utc DESC;
-13️⃣ Virtual Environment
 
-Why .venv?
+-- Reset all data (destructive)
+TRUNCATE TABLE features_orderbook, orderbook_snapshots, tracked_markets, markets CASCADE;
+```
 
-Isolates psycopg, requests, pandas
+---
 
-Prevents version conflicts
+## Database schema
 
-Required for reproducibility
+```
+markets
+  market_id PK, event_id, slug, question, condition_id,
+  end_time, is_closed, is_resolved, is_active, category,
+  volume_num, liquidity_num, updated_at, raw_json (JSONB)
 
-Activate:
+tracked_markets
+  market_id PK → markets.market_id
+  sessions TEXT[], ended BOOL, first_seen_at, last_seen_at, ended_at
 
-.\.venv\Scripts\Activate.ps1
+orderbook_snapshots
+  (token_id, ts_utc) PK
+  market_id → markets.market_id
+  best_bid_price, best_bid_size, best_ask_price, best_ask_size
+  bids_top_n_json, asks_top_n_json, raw_book_json
 
-If PowerShell blocks activation:
+features_orderbook
+  (token_id, ts_utc) PK → orderbook_snapshots
+  spread, mid, microprice, imbalance_l1
+  bid_depth_top_n, ask_depth_top_n
+  seconds_to_expiry, hours_to_expiry
+  extra_features_json (JSONB — top-5 depth metrics etc.)
+```
 
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-14️⃣ Typical End-to-End Flow
-pm migrate
-pm ingest-markets --pages 10
-pm auto-track --session hot --top 200 --allow-missing-token-keys
-pm collect-orderbooks --iterations 10
-pm export --market-id <id> --expected-seconds 2
-Design Philosophy
+---
 
-Postgres is the single source of truth
+## All commands at a glance
 
-tracked_markets gates collection
+```
+pm migrate                Apply SQL migrations
+pm ingest-markets         Fetch market metadata from Gamma API
+pm auto-track             Auto-select and track markets by policy
+pm track-markets          Manually track specific market IDs
+pm refresh-ended          Mark ended/closed markets in tracked_markets
+pm collect-orderbooks     Poll CLOB API, store snapshots + features
+pm export                 Export dataset to CSV
+```
 
-Orderbook features computed inline
-
-Export produces modeling-ready data
-
-Future Improvements
-
-Normalize tokens into market_tokens
-
-Async CLOB requests
-
-Feature versioning
-
-Docker deployment
-
-Materialized feature views
-
-Real-time streaming collector
+Run `pm <command> --help` for the full flag list on any command.
